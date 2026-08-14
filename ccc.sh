@@ -3,7 +3,7 @@
 # encoding=utf-8
 # line ending=\n
 
-# wget https://raw.githubusercontent.com/zero-ljz/scripts/main/shell/ccc.sh
+# wget https://raw.githubusercontent.com/zero-ljz/debian-server-toolkit/main/ccc.sh
 # apt insall sudo
 # bash ./ccc.sh
 
@@ -985,7 +985,7 @@ function docker_build_run(){
     local url="$1"
     local p="$2"
 
-    # bash /root/fast.sh docker_build_run https://github.com/zero-ljz/iapp.git 777:8000
+    # bash /root/ccc.sh docker_build_run https://github.com/zero-ljz/iapp.git 777:8000
     # 请在repos目录使用此函数
     local repo=$(echo "$url" | sed 's|.*/\([^/]*\)\.git|\1|')
     sudo docker rm -f ${repo}1
@@ -1018,7 +1018,7 @@ deploy_python_app() {
         log "Usage: ${FUNCNAME} repo_url http_port command"
         return
     fi
-    # sudo docker rm -f iapp && sudo bash fast.sh deploy_python_app https://github.com/zero-ljz/iapp.git 8000 "python3 -m gunicorn -w 2 -b 0.0.0.0:8000 -k gevent app:app"
+    # sudo docker rm -f iapp && sudo bash ccc.sh deploy_python_app https://github.com/zero-ljz/iapp.git 8000 "python3 -m gunicorn -w 2 -b 0.0.0.0:8000 -k gevent app:app"
     local repo_url="${1}"
     local http_port="${2:-8000}"
     local command="${3:-"python3 -m gunicorn -b 0.0.0.0:8000 app:app"}"
@@ -1319,7 +1319,7 @@ upgrade()
         log "Description: Upgrade this script, Perform this operation in the working directory"
         exit 0
     fi
-    local url="https://raw.githubusercontent.com/zero-ljz/scripts/main/shell/ccc.sh"
+    local url="https://raw.githubusercontent.com/zero-ljz/debian-server-toolkit/main/ccc.sh"
     log "正在从 ${url} 下载最新版本脚本..."
     
     local script_path
