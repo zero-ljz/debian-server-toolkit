@@ -43,6 +43,35 @@ bash ccc.sh deploy_postgres 5432
 bash ccc.sh create_ssl example.com
 ```
 
+`create_proxy` 的第二个参数可以是本地端口或远程 HTTP/HTTPS 地址：
+
+```bash
+# 本地服务，保留请求的 Host
+bash ccc.sh create_proxy proxy.example.com 1234
+
+# 远程 HTTPS 服务，自动设置上游 Host 和 TLS SNI
+bash ccc.sh create_proxy proxy.example.com https://example.com
+
+# 也支持 HTTP 和自定义上游端口
+bash ccc.sh create_proxy proxy.example.com http://example.com:8080
+```
+
+直接填写远程域名（如 `example.com`）时默认使用 HTTPS。远程地址仅支持主机名和可选端口，不支持路径、查询参数或账号密码；末尾的 `/` 会被移除，以保留原始请求路径。自定义端口会包含在上游 Host 中，TLS SNI 始终只使用主机名。
+
+为反向代理站点开启访客访问的 HTTPS，先申请证书，再启用配置：
+
+```bash
+bash ccc.sh create_ssl proxy.example.com
+bash ccc.sh enable_https proxy.example.com
+
+# 可选：同时将 HTTP 请求以 301 跳转到 HTTPS
+bash ccc.sh enable_https proxy.example.com --redirect
+```
+
+`enable_https` 修改 `/etc/nginx/conf.d/域名.conf`，适用于 `create_proxy` 生成的单个 `server` 配置。它检查 `/var/ssl/` 中的证书和私钥是否存在且非空，只取消模板中四项 TLS 配置及可选跳转块的注释；已启用的配置可重复执行，不会重复添加指令，省略 `--redirect` 也不会取消已有跳转。
+
+修改前会保留 `.conf.bak.随机后缀` 备份，执行 `nginx -t` 通过后才重载；写入、校验或重载失败时恢复原配置。优先使用正在运行的 `nginx1` 容器，否则使用宿主机 Nginx。修改过模板结构的自定义配置可能被拒绝，需要手动处理。
+
 部分函数提供帮助信息：
 
 ```bash
@@ -63,7 +92,7 @@ bash ccc.sh upgrade
 | --- | --- |
 | 系统 | `system_init`、`systeminfo`、`install_fail2ban`、`install_monitoring_tools` |
 | 开发环境 | `install_python`、`install_nodejs`、`install_supervisor` |
-| 服务配置 | `create_service`、`create_supervisor`、`create_proxy`、`create_default_vhost` |
+| 服务配置 | `create_service`、`create_supervisor`、`create_proxy`、`create_ssl`、`enable_https`、`create_default_vhost` |
 | 容器与数据服务 | `install_docker`、`deploy_mysql`、`deploy_redis`、`deploy_postgres`、`deploy_rabbitmq` |
 | Web 与应用 | `deploy_nginx`、`deploy_wordpress`、`deploy_gitea`、`deploy_python_app`、`deploy_node_app`、`deploy_php_app` |
 | 网络工具 | `install_aria2`、`install_frp`、`install_frps`、`install_gost` |

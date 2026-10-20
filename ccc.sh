@@ -448,7 +448,7 @@ create_ssl(){
     ssl_certificate_key /var/ssl/${domain_name}.key;
     ssl_protocols TLSv1.2 TLSv1.3;
 EOF
-    log "Please restart nginx"
+    log "Enable HTTPS: bash \"${current_script}\" enable_https ${domain_name} [--redirect]"
     else
         sudo rm -f "$TMP_FULLCHAIN_CRT"
         log "ERROR: SSL generation failed!"
@@ -459,14 +459,54 @@ EOF
 create_proxy(){
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then 
-        log "Usage: ${FUNCNAME} domain_name local_port"
+        log "Usage: ${FUNCNAME} domain_name local_port|upstream_url"
+        log "Examples: ${FUNCNAME} proxy.example.com 1234 | ${FUNCNAME} proxy.example.com https://example.com"
+        log "Upstream: http(s)://hostname[:port] (no path); bare hostnames default to HTTPS."
         return
     fi
 
-    local domain_name="$1"
-    local local_port="$2"
+    if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+        log "Usage: ${FUNCNAME} domain_name local_port|upstream_url"
+        return 1
+    fi
 
-    cat >${domain_name}.conf <<EOF
+    local domain_name="$1"
+    local target="$2"
+    local upstream_url upstream_host upstream_port
+    local proxy_host='$host'
+    local proxy_ssl_config=""
+
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        upstream_port="$target"
+        upstream_url="http://127.0.0.1:${upstream_port}"
+    else
+        # 未指定协议的远程域名默认使用 HTTPS。
+        [[ "$target" == *://* ]] || target="https://${target}"
+        local upstream_pattern='^(https?)://([a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?)(:([0-9]+))?/?$'
+        if [[ ! "$target" =~ $upstream_pattern ]]; then
+            log "ERROR: Upstream must be a local port or http(s)://hostname[:port] without a path."
+            return 1
+        fi
+        upstream_host="${BASH_REMATCH[2]}"
+        upstream_port="${BASH_REMATCH[5]}"
+        upstream_url="${target%/}"
+        proxy_host="${upstream_host}${upstream_port:+:${upstream_port}}"
+        if [[ "$upstream_url" == https://* ]]; then
+            # TLS SNI 只包含主机名，不包含端口。
+            proxy_ssl_config="
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${upstream_host};"
+        fi
+    fi
+
+    if [ -n "$upstream_port" ]; then
+        if [ "${#upstream_port}" -gt 5 ] || (( 10#$upstream_port < 1 || 10#$upstream_port > 65535 )); then
+            log "ERROR: Upstream port must be between 1 and 65535."
+            return 1
+        fi
+    fi
+
+    cat >"${domain_name}.conf" <<EOF
 # 反向代理配置
 
 # 引入 upstream 配置
@@ -508,9 +548,9 @@ server {
         proxy_pass_header Server;
         proxy_set_header X-Forwarded-Host \$server_name;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Host \$host;
+        proxy_set_header Host ${proxy_host};
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:${local_port};
+        proxy_pass ${upstream_url};${proxy_ssl_config}
 
         # WebSocket 转发支持
         proxy_set_header Upgrade \$http_upgrade;
@@ -548,7 +588,7 @@ EOF
     # EOF
 
     # docker cp ./${domain_name}.conf nginx1:/etc/nginx/conf.d/${domain_name}.conf
-    sudo cp ./${domain_name}.conf /etc/nginx/conf.d/${domain_name}.conf
+    sudo cp "./${domain_name}.conf" "/etc/nginx/conf.d/${domain_name}.conf"
 
     if command -v nginx >/dev/null 2>&1; then
         sudo nginx -t && sudo nginx -s reload
@@ -556,6 +596,125 @@ EOF
     if sudo docker ps --format '{{.Names}}' | grep -q '^nginx1$'; then
         sudo docker exec nginx1 nginx -t && sudo docker exec nginx1 nginx -s reload
     fi
+}
+
+enable_https(){
+    if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
+    if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+        log "Usage: ${FUNCNAME} domain_name [--redirect]"
+        log "Enable HTTPS in a create_proxy config; --redirect also redirects HTTP to HTTPS."
+        return
+    fi
+    if [ "$#" -lt 1 ] || [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "$2" != "--redirect" ]; }; then
+        log "Usage: ${FUNCNAME} domain_name [--redirect]"
+        return 1
+    fi
+
+    local domain_name="$1"
+    if [[ ! "$domain_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+        log "ERROR: Invalid domain name."
+        return 1
+    fi
+    local config_file="/etc/nginx/conf.d/${domain_name}.conf"
+    local certificate="/var/ssl/${domain_name}.fullchain.crt"
+    local private_key="/var/ssl/${domain_name}.key"
+    local redirect=0
+    [ "${2:-}" = "--redirect" ] && redirect=1
+
+    if ! sudo test -f "$config_file"; then
+        log "ERROR: Config not found: ${config_file}"
+        return 1
+    fi
+    if ! sudo test -s "$certificate" || ! sudo test -s "$private_key"; then
+        log "ERROR: Certificate or private key missing/empty. Run create_ssl ${domain_name} first."
+        return 1
+    fi
+
+    # 优先使用 deploy_nginx 创建的容器，否则使用宿主机 Nginx。
+    local -a nginx_command
+    if command -v docker >/dev/null 2>&1 && sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'nginx1'; then
+        nginx_command=(sudo docker exec nginx1 nginx)
+    elif command -v nginx >/dev/null 2>&1; then
+        nginx_command=(sudo nginx)
+    else
+        log "ERROR: No running nginx1 container or host nginx executable found."
+        return 1
+    fi
+
+    local temp_file backup_file
+    temp_file=$(mktemp) || return 1
+    # 仅处理模板中的四项 TLS 配置和完整的三行跳转块。
+    # 缺少模板项或包含多个 server 块时拒绝修改，避免误改自定义配置。
+    if ! sudo awk -v domain="$domain_name" -v redirect="$redirect" '
+        function clean(line) {
+            sub(/^[[:space:]]*#[[:space:]]*/, "", line)
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            return line
+        }
+        function uncomment(line) {
+            sub(/#[ \t]?/, "", line)
+            return line
+        }
+        BEGIN {
+            settings["listen 443 ssl;"] = 1
+            settings["ssl_certificate /var/ssl/" domain ".fullchain.crt;"] = 1
+            settings["ssl_certificate_key /var/ssl/" domain ".key;"] = 1
+            settings["ssl_protocols TLSv1.2 TLSv1.3;"] = 1
+        }
+        {
+            line = clean($0)
+            if (line == "server {") servers++
+            if (line == "server_name " domain ";") names++
+            if (line in settings) {
+                seen[line]++
+                $0 = uncomment($0)
+            }
+            if (redirect && line == "if ($scheme = http ) {") {
+                redirects++
+                print uncomment($0)
+                if ((getline action) != 1 || clean(action) != "return 301 https://$host$request_uri;") exit 1
+                if ((getline closing) != 1 || clean(closing) != "}") exit 1
+                print uncomment(action)
+                print uncomment(closing)
+                next
+            }
+            print
+        }
+        END {
+            for (setting in settings) if (seen[setting] != 1) exit 1
+            if (servers != 1 || names != 1 || (redirect && redirects != 1)) exit 1
+        }
+    ' "$config_file" > "$temp_file"; then
+        rm -f -- "$temp_file"
+        log "ERROR: Config does not match the create_proxy HTTPS template; no changes made."
+        return 1
+    fi
+
+    # 备份不以 .conf 结尾，避免被 Nginx 当作站点配置加载。
+    if ! backup_file=$(sudo mktemp "${config_file}.bak.XXXXXX"); then
+        rm -f -- "$temp_file"
+        return 1
+    fi
+    if ! sudo cp -p -- "$config_file" "$backup_file"; then
+        rm -f -- "$temp_file"
+        sudo rm -f -- "$backup_file"
+        log "ERROR: Could not back up ${config_file}; no changes made."
+        return 1
+    fi
+
+    if ! sudo cp -- "$temp_file" "$config_file" || ! "${nginx_command[@]}" -t || ! "${nginx_command[@]}" -s reload; then
+        rm -f -- "$temp_file"
+        if sudo cp -p -- "$backup_file" "$config_file"; then
+            log "ERROR: HTTPS activation failed; original config restored from ${backup_file}."
+        else
+            log "ERROR: HTTPS activation and restore failed. Restore ${config_file} from ${backup_file} manually."
+        fi
+        return 1
+    fi
+
+    rm -f -- "$temp_file"
+    log "HTTPS enabled for ${domain_name}. Backup: ${backup_file}"
 }
 
 deploy_mysql(){
