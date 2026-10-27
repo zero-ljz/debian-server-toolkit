@@ -58,6 +58,8 @@ bash ccc.sh create_proxy proxy.example.com http://example.com:8080
 
 直接填写远程域名（如 `example.com`）时默认使用 HTTPS。远程地址仅支持主机名和可选端口，不支持路径、查询参数或账号密码；末尾的 `/` 会被移除，以保留原始请求路径。自定义端口会包含在上游 Host 中，TLS SNI 始终只使用主机名。
 
+`create_proxy` 覆盖已有站点配置前会保留 `.conf.bak.随机后缀` 备份。检测到的宿主机 Nginx 和 `nginx1` 容器都通过 `nginx -t` 后才重载；任一校验失败时恢复原配置，首次创建则移除新配置，并返回非零状态。
+
 为反向代理站点开启访客访问的 HTTPS，先申请证书，再启用配置：
 
 ```bash
@@ -68,7 +70,7 @@ bash ccc.sh enable_https proxy.example.com
 bash ccc.sh enable_https proxy.example.com --redirect
 ```
 
-`enable_https` 修改 `/etc/nginx/conf.d/域名.conf`，适用于 `create_proxy` 生成的单个 `server` 配置。它检查 `/var/ssl/` 中的证书和私钥是否存在且非空，只取消模板中四项 TLS 配置及可选跳转块的注释；已启用的配置可重复执行，不会重复添加指令，省略 `--redirect` 也不会取消已有跳转。
+`enable_https` 修改 `/etc/nginx/conf.d/域名.conf`，适用于 `create_proxy` 生成的单个 `server` 配置。它检查 `/var/ssl/` 中的证书和私钥是否存在且非空，启用模板中的 IPv4、IPv6 TLS 监听、证书配置及可选跳转块；旧版模板缺少 `listen [::]:443 ssl;` 时会自动补齐。已启用的配置可重复执行，不会重复添加指令，省略 `--redirect` 也不会取消已有跳转。
 
 修改前会保留 `.conf.bak.随机后缀` 备份，执行 `nginx -t` 通过后才重载；写入、校验或重载失败时恢复原配置。优先使用正在运行的 `nginx1` 容器，否则使用宿主机 Nginx。修改过模板结构的自定义配置可能被拒绝，需要手动处理。
 
@@ -79,6 +81,8 @@ bash ccc.sh enable_https proxy.example.com --redirect
 ```bash
 bash ccc.sh deploy_postgres --help
 ```
+
+`docker_build_run repo_url 8080:80` 会在私有临时目录中克隆和构建，成功后才删除同名旧容器并运行新镜像。支持远程仓库地址和本地仓库路径，仓库名须符合 Docker 小写镜像名称规则；源仓库及当前目录中的同名目录不会被删除。克隆或构建失败时保留原容器，旧镜像不主动删除，临时克隆目录在函数退出时清理。
 
 更新当前脚本：
 

@@ -59,7 +59,7 @@ class RegressionTests(unittest.TestCase):
     def save_state(self):
         (self.root / "state.json").write_text(json.dumps(self.state))
 
-    def run_function(self, name, *args, success=True):
+    def run_function(self, name, *args, success=True, cwd=None):
         self.save_state()
         # Load definitions only. Never execute the script's command dispatcher.
         shell = '''source "$1"
@@ -68,7 +68,7 @@ shift
 "$@"
 '''
         result = subprocess.run(["bash", "-c", shell, "test", str(self.definitions), name, *args],
-                                cwd=self.root, env=self.env, input="y\n", text=True,
+                                cwd=cwd or self.root, env=self.env, input="y\n", text=True,
                                 capture_output=True, timeout=30)
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -260,6 +260,121 @@ shift
         self.state["nginx_backend"] = "host"
         self.run_function("create_ssl", "example.com")
         self.assertEqual([call["args"] for call in self.calls("nginx")], [["-t"], ["-s", "reload"]])
+
+    def proxy_config(self):
+        directory = self.root / "fs/etc/nginx/conf.d"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / "example.com.conf"
+
+    def nginx_calls(self):
+        return [call["args"] if call["command"] == "nginx" else call["args"][3:]
+                for call in self.calls()
+                if call["command"] == "nginx" or
+                (call["command"] == "docker" and call["args"][:3] == ["exec", "nginx1", "nginx"])]
+
+    def test_proxy_validation_failure_restores_contents_and_permissions(self):
+        config = self.proxy_config()
+        original = b"# existing HTTPS site configuration\n"
+        for backend, cwd in (("host", self.root), ("docker", self.root),
+                             ("docker", config.parent)):
+            with self.subTest(backend=backend, cwd=cwd):
+                config.write_bytes(original)
+                config.chmod(0o640)
+                self.state["nginx_backend"] = backend
+                self.state["nginx_test_failure_backend"] = backend
+                self.run_function("create_proxy", "example.com", "8000", success=False, cwd=cwd)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+        self.assertNotIn(["-s", "reload"], self.nginx_calls())
+
+    def test_proxy_first_creation_validation_failure_removes_config(self):
+        config = self.proxy_config()
+        for backend in ("host", "docker"):
+            with self.subTest(backend=backend):
+                self.state["nginx_backend"] = backend
+                self.state["nginx_test_failure_backend"] = backend
+                self.run_function("create_proxy", "example.com", "8000", success=False)
+                self.assertFalse(config.exists())
+        self.assertNotIn(["-s", "reload"], self.nginx_calls())
+
+    def test_proxy_validates_all_backends_before_reloading(self):
+        config = self.proxy_config()
+        self.run_function("create_proxy", "example.com", "https://upstream.example:8443")
+        self.assertIn("proxy_pass https://upstream.example:8443;", config.read_text())
+        self.assertEqual(self.nginx_calls(), [["-t"], ["-t"], ["-s", "reload"], ["-s", "reload"]])
+
+    def test_enable_https_supports_ipv6_and_legacy_templates_idempotently(self):
+        config = self.proxy_config()
+        self.setup_certificate()
+        self.run_function("create_proxy", "example.com", "8000")
+        template = config.read_text()
+        for legacy in (False, True):
+            for enabled in (False, True):
+                with self.subTest(legacy=legacy, enabled=enabled):
+                    contents = template
+                    if legacy:
+                        contents = contents.replace("    # listen [::]:443 ssl;\n", "")
+                    if enabled:
+                        contents = contents.replace("# listen 443 ssl;", "listen 443 ssl;")
+                        contents = contents.replace("# ssl_", "ssl_")
+                    config.write_text(contents)
+                    self.run_function("enable_https", "example.com", "--redirect")
+                    first = config.read_text()
+                    self.run_function("enable_https", "example.com")
+                    self.assertEqual(config.read_text(), first)
+                    lines = [line.strip() for line in first.splitlines()]
+                    self.assertEqual(lines.count("listen 443 ssl;"), 1)
+                    self.assertEqual(lines.count("listen [::]:443 ssl;"), 1)
+                    self.assertEqual(lines.count("return 301 https://$host$request_uri;"), 1)
+
+    def test_enable_https_validation_failure_restores_legacy_template(self):
+        config = self.proxy_config()
+        self.setup_certificate()
+        self.run_function("create_proxy", "example.com", "8000")
+        original = config.read_text().replace("    # listen [::]:443 ssl;\n", "")
+        config.write_text(original)
+        self.state["nginx_test_failure"] = True
+        self.run_function("enable_https", "example.com", success=False)
+        self.assertEqual(config.read_text(), original)
+
+    def test_build_preserves_local_source_and_same_named_working_directory(self):
+        source = self.root / "local source/app"
+        checkout = self.root / "app"
+        for directory in (source, checkout):
+            directory.mkdir(parents=True)
+            (directory / "uncommitted.txt").write_text("preserve me\n")
+        self.state["containers"] = ["app1"]
+        self.run_function("docker_build_run", str(source), "8080:80")
+        for directory in (source, checkout):
+            self.assertEqual((directory / "uncommitted.txt").read_text(), "preserve me\n")
+        operations = [call["args"][0] for call in self.calls() if call["command"] in ("git", "docker")]
+        self.assertEqual(operations, ["clone", "build", "container", "rm", "run", "exec"])
+        self.assertEqual(list(self.root.glob("ccc-build.*")), [])
+
+    def test_build_clone_failure_preserves_old_deployment(self):
+        self.state.update(containers=["app1"], fail_stage="git:clone")
+        self.run_function("docker_build_run", "https://example.com/app.git", "8080:80", success=False)
+        self.assertEqual(self.calls("docker"), [])
+        self.assertEqual(list(self.root.glob("ccc-build.*")), [])
+
+    def test_build_failure_preserves_old_deployment(self):
+        self.state.update(containers=["app1"], build_failure=True)
+        self.run_function("docker_build_run", "https://example.com/app.git", "8080:80", success=False)
+        self.assertEqual([call["args"][0] for call in self.calls("docker")], ["build"])
+        self.assertEqual(list(self.root.glob("ccc-build.*")), [])
+
+    def test_build_refuses_invalid_names_before_cloning_or_deleting(self):
+        for url in (".", "..", "/", "https://example.com/..git", "--option"):
+            with self.subTest(url=url):
+                self.run_function("docker_build_run", url, "8080:80", success=False)
+        self.assertEqual(self.calls("git"), [])
+        self.assertEqual(self.calls("docker"), [])
+
+    def test_build_stops_when_old_container_cannot_be_removed(self):
+        self.state.update(containers=["app1"], container_remove_failure=True)
+        self.run_function("docker_build_run", "https://example.com/app.git", "8080:80", success=False)
+        self.assertFalse(any(call["args"][0] == "run" for call in self.calls("docker")))
+        self.assertEqual(list(self.root.glob("ccc-build.*")), [])
 
     def test_application_setup_stops_after_dependency_failure(self):
         self.state.update(execute_container=True, fail_stage="apt-get:install")

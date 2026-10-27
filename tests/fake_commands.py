@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -22,7 +23,7 @@ def record(command, args, elevated=False):
 
 def mapped(arg):
     for prefix in ("/var/ssl", "/var/www/challenges", "/opt/gitea", "/etc/aria2",
-                   "/etc/gost", "/etc/systemd/system", "/usr/local/bin"):
+                   "/etc/gost", "/etc/systemd/system", "/usr/local/bin", "/etc/nginx/conf.d"):
         if arg == prefix or arg.startswith(prefix + "/"):
             return str(ROOT / "fs" / arg.lstrip("/"))
     return arg
@@ -64,8 +65,13 @@ def docker(args):
             return container_script(args)
         print("test-container-id")
         return 0
+    if args[0] == "build":
+        assert Path(args[-1]).is_dir(), args
+        return int(state.get("build_failure", False))
+    if args[0] == "rm":
+        return int(state.get("container_remove_failure", False))
     if args[:3] == ["exec", "nginx1", "nginx"]:
-        return nginx(args[3:])
+        return nginx(args[3:], backend="docker")
     if args[0] == "exec":
         return container_script(args) if "-c" in args else 0
     if args[0] == "logs":
@@ -73,8 +79,9 @@ def docker(args):
     raise RuntimeError("Unexpected Docker command: " + repr(args))
 
 
-def nginx(args):
-    return int((args == ["-t"] and state.get("nginx_test_failure", False)) or
+def nginx(args, backend="host"):
+    return int((args == ["-t"] and (state.get("nginx_test_failure", False) or
+                                   state.get("nginx_test_failure_backend") == backend)) or
                (args == ["-s", "reload"] and state.get("nginx_reload_failure", False)))
 
 
@@ -140,7 +147,7 @@ def sudo(args):
         assert args[:2] == ["-c", 'umask 022; exec /usr/bin/python3 "$@"'], args
     else:
         assert command in {"test", "install", "mktemp", "openssl", "chmod", "chown", "ln",
-                           "rm", "cp", "mv", "grep", "mkdir", "touch", "tar"}, command
+                           "rm", "cp", "mv", "grep", "mkdir", "touch", "tar", "awk"}, command
     args = [mapped(arg) for arg in args]
     if command == "install":
         # Tests run without privileges; preserve modes, omit ownership changes.
@@ -177,7 +184,17 @@ def main():
     if command in {"apt-get", "git", "npm", "python3"}:
         action = next((arg for arg in args if not arg.startswith("-")), "")
         stage = command + (":" + action if action else "")
-        return 1 if state.get("fail_stage") == stage else 0
+        if state.get("fail_stage") == stage:
+            return 1
+        if command == "git" and action == "clone" and args[-1] != ".":
+            destination = Path(args[-1])
+            assert destination.resolve().is_relative_to(ROOT), args
+            source = Path(args[-2])
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                destination.mkdir()
+        return 0
     if command == "curl":
         if state.get("download_failure"):
             return 22

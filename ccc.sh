@@ -538,7 +538,19 @@ create_proxy(){
         fi
     fi
 
-    cat >"${domain_name}.conf" <<EOF
+    local config_file="/etc/nginx/conf.d/${domain_name}.conf"
+    local backup_file=""
+    # 先备份，兼容直接在 conf.d 目录中执行；备份不参与 Nginx 配置加载。
+    if sudo test -e "$config_file"; then
+        backup_file=$(sudo mktemp "${config_file}.bak.XXXXXX") || return 1
+        if ! sudo cp -p -- "$config_file" "$backup_file"; then
+            sudo rm -f -- "$backup_file"
+            log "ERROR: Could not back up ${config_file}; no changes made."
+            return 1
+        fi
+    fi
+
+    cat >"${domain_name}.conf" <<EOF || return 1
 # 反向代理配置
 
 # 引入 upstream 配置
@@ -560,6 +572,7 @@ server {
 
     # SSL/TLS 配置
     # listen 443 ssl;
+    # listen [::]:443 ssl;
     # ssl_certificate /var/ssl/${domain_name}.fullchain.crt;
     # ssl_certificate_key /var/ssl/${domain_name}.key;
     # ssl_protocols TLSv1.2 TLSv1.3;
@@ -613,21 +626,36 @@ server {
 
 EOF
 
-    # docker exec -i nginx1 sh <<EOF
-    # cat > /etc/nginx/conf.d/blog.iapp.run.conf <<EOF2
+    if ! sudo test "./${domain_name}.conf" -ef "$config_file"; then
+        sudo cp -- "./${domain_name}.conf" "$config_file" || return 1
+    fi
 
-    # EOF2
-    # EOF
-
-    # docker cp ./${domain_name}.conf nginx1:/etc/nginx/conf.d/${domain_name}.conf
-    sudo cp "./${domain_name}.conf" "/etc/nginx/conf.d/${domain_name}.conf"
-
+    local host_nginx=0 container_nginx=0 validation_failed=0
+    # 所有可用实例校验通过后才重载，防止部分实例先加载了待回滚配置。
     if command -v nginx >/dev/null 2>&1; then
-        sudo nginx -t && sudo nginx -s reload
+        host_nginx=1
+        sudo nginx -t || validation_failed=1
     fi
-    if sudo docker ps --format '{{.Names}}' | grep -q '^nginx1$'; then
-        sudo docker exec nginx1 nginx -t && sudo docker exec nginx1 nginx -s reload
+    if command -v docker >/dev/null 2>&1 && sudo docker ps --format '{{.Names}}' | grep -qx 'nginx1'; then
+        container_nginx=1
+        sudo docker exec nginx1 nginx -t || validation_failed=1
     fi
+    if [ "$validation_failed" -eq 1 ]; then
+        if [ -n "$backup_file" ]; then
+            if ! sudo cp -p -- "$backup_file" "$config_file"; then
+                log "ERROR: Nginx validation and restore failed. Restore ${config_file} from ${backup_file} manually."
+                return 1
+            fi
+        elif ! sudo rm -f -- "$config_file"; then
+            log "ERROR: Nginx validation failed; remove ${config_file} manually."
+            return 1
+        fi
+        log "ERROR: Nginx validation failed; previous config restored (new config removed on first creation)."
+        return 1
+    fi
+    if [ "$host_nginx" -eq 1 ]; then sudo nginx -s reload || return 1; fi
+    if [ "$container_nginx" -eq 1 ]; then sudo docker exec nginx1 nginx -s reload || return 1; fi
+    return 0
 }
 
 enable_https(){
@@ -675,7 +703,7 @@ enable_https(){
 
     local temp_file backup_file
     temp_file=$(mktemp) || return 1
-    # 仅处理模板中的四项 TLS 配置和完整的三行跳转块。
+    # 处理模板中的 TLS 配置和完整的三行跳转块；旧模板补齐 IPv6 监听。
     # 缺少模板项或包含多个 server 块时拒绝修改，避免误改自定义配置。
     if ! sudo awk -v domain="$domain_name" -v redirect="$redirect" '
         function clean(line) {
@@ -690,9 +718,14 @@ enable_https(){
         }
         BEGIN {
             settings["listen 443 ssl;"] = 1
+            settings["listen [::]:443 ssl;"] = 1
             settings["ssl_certificate /var/ssl/" domain ".fullchain.crt;"] = 1
             settings["ssl_certificate_key /var/ssl/" domain ".key;"] = 1
             settings["ssl_protocols TLSv1.2 TLSv1.3;"] = 1
+        }
+        FNR == NR {
+            if (clean($0) == "listen [::]:443 ssl;") ipv6++
+            next
         }
         {
             line = clean($0)
@@ -701,6 +734,12 @@ enable_https(){
             if (line in settings) {
                 seen[line]++
                 $0 = uncomment($0)
+            }
+            if (line == "listen 443 ssl;" && !ipv6) {
+                print $0
+                print "    listen [::]:443 ssl;"
+                seen["listen [::]:443 ssl;"]++
+                next
             }
             if (redirect && line == "if ($scheme = http ) {") {
                 redirects++
@@ -717,7 +756,7 @@ enable_https(){
             for (setting in settings) if (seen[setting] != 1) exit 1
             if (servers != 1 || names != 1 || (redirect && redirects != 1)) exit 1
         }
-    ' "$config_file" > "$temp_file"; then
+    ' "$config_file" "$config_file" > "$temp_file"; then
         rm -f -- "$temp_file"
         log "ERROR: Config does not match the create_proxy HTTPS template; no changes made."
         return 1
@@ -1197,28 +1236,42 @@ EOF
 
 
 
-function docker_build_run(){
+docker_build_run() (
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
         log "Usage: ${FUNCNAME} repo_url port_port"
         return
     fi
     
-    local url="$1"
-    local p="$2"
+    if [ "$#" -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
+        log "Usage: ${FUNCNAME} repo_url port_port"
+        return 1
+    fi
+    local url="$1" p="$2"
+    local repo="${url%/}"
+    repo="${repo##*/}"
+    repo="${repo##*:}"
+    repo="${repo%.git}"
+    if [[ ! "$repo" =~ ^[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*$ ]]; then
+        log "ERROR: Repository name must be a valid lowercase Docker image name."
+        return 1
+    fi
 
     # bash /root/ccc.sh docker_build_run https://github.com/zero-ljz/iapp.git 777:8000
-    # 请在repos目录使用此函数
-    local repo=$(echo "$url" | sed 's|.*/\([^/]*\)\.git|\1|')
-    sudo docker rm -f ${repo}1
-    sudo docker image rm ${repo}
-    rm -rf ${repo}
+    # 只清理本次创建的临时目录，不删除源仓库或当前目录中的同名目录。
+    local work_dir
+    work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ccc-build.XXXXXX") || return 1
+    trap 'rm -rf -- "$work_dir"' EXIT
+    git clone -- "$url" "$work_dir/source" || return 1
+    sudo docker build -t "$repo" "$work_dir/source" || return 1
 
-    git clone ${url}
-    sudo docker build -t ${repo} ${repo}
-    sudo docker run -p ${p} --name ${repo}1 ${repo}
-    sudo docker exec -it ${repo}1 sh
-}
+    # 克隆和构建成功后才替换旧容器，保留旧镜像供恢复。
+    if sudo docker container inspect "${repo}1" >/dev/null 2>&1; then
+        sudo docker rm -f "${repo}1" || return 1
+    fi
+    sudo docker run -p "$p" --name "${repo}1" "$repo" || return 1
+    sudo docker exec -it "${repo}1" sh
+)
 
 deploy_debian() {
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
