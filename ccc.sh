@@ -355,106 +355,138 @@ install_nodejs(){
     # npm config set registry https://registry.npmmirror.com
 }
 
-create_ssl(){
+_valid_domain_name(){
+    local domain="${1:-}"
+    [[ ${#domain} -le 253 && "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
+}
+
+create_ssl() (
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-        log "Usage: ${FUNCNAME} domain_name [acme_dir]"
+        log "Usage: ${FUNCNAME} domain_name"
         return
     fi
 
-    local domain_name="$1"
-
-    # acme_dir=${2:-/var/www/${domain_name}/.well-known/acme-challenge/} 
-    local acme_dir="/var/www/challenges/${domain_name}/"
-
-    # 自动在 crontab 中写入“每天凌晨固定检查”的任务
-    local current_script=$(readlink -f "$0")
-    # 确保是通过脚本文件执行，而不是直接在终端粘贴函数
-    if [[ "$current_script" != *"bash"* ]] && [ -f "$current_script" ]; then
-        local cron_job="15 3 * * * CRON_EXECUTION=1 bash $current_script create_ssl $domain_name"
-        if ! sudo crontab -l 2>/dev/null | grep -q "create_ssl $domain_name"; then
-            (sudo crontab -l 2>/dev/null; echo "$cron_job") | sudo crontab -
-            log "SUCCESS: Daily health-check cron job added."
-        fi
-    fi
-
-    local SSL_DIR="/var/ssl"
-    if [ ! -d "$SSL_DIR" ]; then
-        sudo mkdir -p "$SSL_DIR"
-    fi
-
-    local ACME_TINY="/tmp/acme_tiny.py"
-    local ACCOUNT_KEY="$SSL_DIR/account.key"
-    # 私钥
-    local DOMAIN_KEY="$SSL_DIR/${domain_name}.key"
-    # 公钥（完整证书链）
-    local DOMAIN_FULLCHAIN_CRT="$SSL_DIR/${domain_name}.fullchain.crt"
-
-    local DOMAIN_CSR="$SSL_DIR/${domain_name}.csr"
-
-    local TMP_FULLCHAIN_CRT="$DOMAIN_FULLCHAIN_CRT.tmp"
-
-
-    # ==========================================
-    # 🆕 智能检查：如果证书存在，且剩余天数大于 30 天，则直接退出，不重复申请
-    # ==========================================
-    if [ -f "$DOMAIN_FULLCHAIN_CRT" ]; then
-        # 获取证书过期的绝对时间戳（秒）
-        local expire_time=$(openssl x509 -enddate -noout -in "$DOMAIN_FULLCHAIN_CRT" | cut -d= -f2)
-        local expire_timestamp=$(date -d "$expire_time" +%s)
-        # 获取当前时间戳
-        local current_timestamp=$(date +%s)
-        # 计算剩余天数
-        local rem_days=$(( (expire_timestamp - current_timestamp) / 86400 ))
-
-        # 如果是日常定时任务检查，且剩余天数大于 30 天，则静默退出
-        if [ "$CRON_EXECUTION" = "1" ] && [ "$rem_days" -gt 30 ]; then
-            # 记录一条简短日志说明证书还很安全
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Certificate for $domain_name is still valid for $rem_days days. No renewal needed." >> /var/log/ssl_renew_${domain_name}.log
-            return 0
-        fi
-        log "Current certificate expires in $rem_days days. Proceeding..."
-    fi
-
-
-    # 文件不存在时创建 Let's Encrypt 帐户私钥
-    if [ ! -f "$ACCOUNT_KEY" ]; then
-        log "Generate account key..."
-        sudo openssl genrsa -out "$ACCOUNT_KEY" 4096
-    fi
-
-    if [ ! -f "$DOMAIN_KEY" ]; then
-        log "Generate domain key 私钥..."
-        sudo openssl genrsa -out "$DOMAIN_KEY" 2048
-    fi
-
-    log "Generate CSR..."
-    openssl req -new -sha256 -key "$DOMAIN_KEY" -subj "/" -reqexts SAN -config <(cat /etc/ssl/openssl.cnf <(printf "[SAN]\nsubjectAltName=%s" "DNS:${domain_name}")) -out "${DOMAIN_CSR}"
-
-    sudo mkdir -p "$acme_dir"
-
-    wget https://raw.githubusercontent.com/diafygi/acme-tiny/master/acme_tiny.py -O "$ACME_TINY" --quiet
-    sudo /usr/bin/python3 $ACME_TINY --account-key "$ACCOUNT_KEY" --csr "${DOMAIN_CSR}" --acme-dir "$acme_dir" | sudo tee "$TMP_FULLCHAIN_CRT" > /dev/null
-
-    if [ $? -eq 0 ] && sudo openssl x509 -in "$TMP_FULLCHAIN_CRT" -noout >/dev/null 2>&1; then
-        sudo mv "$TMP_FULLCHAIN_CRT" "$DOMAIN_FULLCHAIN_CRT"
-        cat << EOF
-执行 nano /etc/nginx/conf.d/${domain_name}.conf
-
-在nginx网站配置的server块中添加以下内容:
-
-    listen 443 ssl;
-    ssl_certificate /var/ssl/${domain_name}.fullchain.crt;
-    ssl_certificate_key /var/ssl/${domain_name}.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-EOF
-    log "Enable HTTPS: bash \"${current_script}\" enable_https ${domain_name} [--redirect]"
-    else
-        sudo rm -f "$TMP_FULLCHAIN_CRT"
-        log "ERROR: SSL generation failed!"
+    if [ "$#" -ne 1 ] || ! _valid_domain_name "$1"; then
+        log "ERROR: Provide one valid domain name."
         return 1
     fi
-}
+    local domain_name="$1"
+    local acme_dir="/var/www/challenges/${domain_name}/"
+    local current_script
+    current_script=$(readlink -f "${BASH_SOURCE[0]}") || return 1
+    local SSL_DIR="/var/ssl"
+    local ACCOUNT_KEY="$SSL_DIR/account.key"
+    local DOMAIN_KEY="$SSL_DIR/${domain_name}.key"
+    local DOMAIN_FULLCHAIN_CRT="$SSL_DIR/${domain_name}.fullchain.crt"
+    local DOMAIN_CSR="$SSL_DIR/${domain_name}.csr"
+
+    if [ "${CRON_EXECUTION:-}" = "1" ] && sudo test -s "$DOMAIN_FULLCHAIN_CRT" &&
+        sudo openssl x509 -checkend 2592000 -noout -in "$DOMAIN_FULLCHAIN_CRT" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local -a nginx_command
+    if command -v docker >/dev/null 2>&1 && sudo docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'nginx1'; then
+        nginx_command=(sudo docker exec nginx1 nginx)
+    elif command -v nginx >/dev/null 2>&1; then
+        nginx_command=(sudo nginx)
+    else
+        log "ERROR: No running nginx1 container or host nginx found; cannot reload the certificate."
+        return 1
+    fi
+
+    sudo install -d -m 0755 -o root -g root "$SSL_DIR" "$acme_dir" || return 1
+    local work_dir
+    work_dir=$(sudo mktemp -d "$SSL_DIR/.acme-${domain_name}.XXXXXX") || return 1
+    # root 创建的 0700 临时目录，避免执行其他用户预先放置的程序。
+    trap 'sudo rm -rf -- "$work_dir"' EXIT
+    local ACME_TINY="$work_dir/acme_tiny.py"
+    local TMP_FULLCHAIN_CRT="$work_dir/fullchain.crt"
+
+    # 先生成完整密钥再以硬链接发布；并发申请也不会覆盖已有密钥。
+    local key bits
+    for key in "$ACCOUNT_KEY" "$DOMAIN_KEY"; do
+        if ! sudo test -e "$key"; then
+            bits=2048
+            [ "$key" = "$ACCOUNT_KEY" ] && bits=4096
+            sudo openssl genrsa -out "$work_dir/new.key" "$bits" || return 1
+            sudo chmod 600 "$work_dir/new.key" || return 1
+            sudo ln -- "$work_dir/new.key" "$key" || { sudo test -s "$key" || return 1; }
+            sudo rm -- "$work_dir/new.key" || return 1
+        fi
+        sudo openssl pkey -in "$key" -noout >/dev/null || return 1
+    done
+
+    log "Generate CSR..."
+    sudo openssl req -new -sha256 -key "$DOMAIN_KEY" -subj "/" \
+        -addext "subjectAltName=DNS:${domain_name}" -out "$work_dir/domain.csr" || return 1
+    sudo install -m 0644 "$work_dir/domain.csr" "$DOMAIN_CSR" || return 1
+    if ! sudo wget --quiet -O "$ACME_TINY" https://raw.githubusercontent.com/diafygi/acme-tiny/master/acme_tiny.py; then
+        log "ERROR: ACME client download failed; no client executed."
+        return 1
+    fi
+    # 同时检查签发程序和证书写入的状态；挑战文件需能被 Nginx 读取。
+    if ! (set -o pipefail
+        sudo sh -c 'umask 022; exec /usr/bin/python3 "$@"' sh "$ACME_TINY" \
+            --account-key "$ACCOUNT_KEY" --csr "$work_dir/domain.csr" --acme-dir "$acme_dir" |
+            sudo tee "$TMP_FULLCHAIN_CRT" >/dev/null
+    ); then
+        log "ERROR: SSL generation failed; existing certificate preserved."
+        return 1
+    fi
+    sudo openssl x509 -checkend 0 -noout -in "$TMP_FULLCHAIN_CRT" >/dev/null || return 1
+    # x509 -checkhost 在域名不匹配时仍可能返回 0；verify 会正确返回失败。
+    sudo openssl verify -verify_hostname "$domain_name" -partial_chain \
+        -trusted "$TMP_FULLCHAIN_CRT" "$TMP_FULLCHAIN_CRT" >/dev/null || return 1
+    local cert_public_key domain_public_key
+    cert_public_key=$(sudo openssl x509 -pubkey -noout -in "$TMP_FULLCHAIN_CRT") || return 1
+    domain_public_key=$(sudo openssl pkey -pubout -in "$DOMAIN_KEY") || return 1
+    if [ "$cert_public_key" != "$domain_public_key" ]; then
+        log "ERROR: Certificate does not match the domain key."
+        return 1
+    fi
+
+    local had_certificate=0
+    if sudo test -e "$DOMAIN_FULLCHAIN_CRT"; then
+        sudo cp -p -- "$DOMAIN_FULLCHAIN_CRT" "$work_dir/previous.crt" || return 1
+        had_certificate=1
+    fi
+    sudo chmod 644 "$TMP_FULLCHAIN_CRT" || return 1
+    sudo mv -f -- "$TMP_FULLCHAIN_CRT" "$DOMAIN_FULLCHAIN_CRT" || return 1
+    if ! "${nginx_command[@]}" -t || ! "${nginx_command[@]}" -s reload; then
+        if [ "$had_certificate" -eq 1 ]; then
+            if ! sudo mv -f -- "$work_dir/previous.crt" "$DOMAIN_FULLCHAIN_CRT"; then
+                trap - EXIT
+                log "ERROR: Reload and restore failed; recover the previous certificate from $work_dir/previous.crt."
+                return 1
+            fi
+        else
+            sudo rm -f -- "$DOMAIN_FULLCHAIN_CRT" || return 1
+        fi
+        log "ERROR: Nginx validation/reload failed; renewal is not complete."
+        return 1
+    fi
+
+    # 签发并重载成功后才登记定时任务，路径中的空格使用 shell 转义。
+    if [[ "$current_script" == *$'\n'* || "$current_script" == *%* ]]; then
+        log "ERROR: Certificate installed, but cron cannot use a script path containing a newline or %."
+        return 1
+    fi
+    local cron_job cron_contents
+    printf -v cron_job '15 3 * * * CRON_EXECUTION=1 bash %q create_ssl %q' "$current_script" "$domain_name"
+    if ! cron_contents=$(sudo sh -c 'LC_ALL=C crontab -l 2>"$1"' sh "$work_dir/cron.err"); then
+        if ! sudo grep -q '^no crontab for ' "$work_dir/cron.err"; then
+            log "ERROR: Certificate installed, but the existing crontab could not be read; no cron changes made."
+            return 1
+        fi
+        cron_contents=""
+    fi
+    if ! grep -Fxq -- "$cron_job" <<< "$cron_contents"; then
+        printf '%s\n%s\n' "$cron_contents" "$cron_job" | sudo crontab - || return 1
+    fi
+    log "Certificate installed and Nginx reloaded. Enable HTTPS: bash \"${current_script}\" enable_https ${domain_name} [--redirect]"
+)
 
 create_proxy(){
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
@@ -717,6 +749,47 @@ enable_https(){
     log "HTTPS enabled for ${domain_name}. Backup: ${backup_file}"
 }
 
+_deploy_database_container() (
+    local container="$1" volume="$2" password_file="$3" password_variable="$4"
+    shift 4
+    local password password_temp=""
+    trap '[ -z "$password_temp" ] || rm -f -- "$password_temp"' EXIT
+
+    sudo docker info >/dev/null || return 1
+    if sudo docker container inspect "$container" >/dev/null 2>&1; then
+        log "ERROR: Container $container already exists; its data and saved password were preserved."
+        return 1
+    fi
+    if [ -e "$password_file" ]; then
+        if [ ! -f "$password_file" ] || [ ! -s "$password_file" ]; then
+            log "ERROR: $password_file must contain the existing database password."
+            return 1
+        fi
+        password=$(cat -- "$password_file") || return 1
+        if [ -z "$password" ] || [[ "$password" == *$'\n'* || "$password" == *$'\r'* ]]; then
+            log "ERROR: $password_file must contain one non-empty password line."
+            return 1
+        fi
+    elif sudo docker volume inspect "$volume" >/dev/null 2>&1; then
+        log "ERROR: Volume $volume already exists. Restore its original password in $password_file before redeploying."
+        return 1
+    else
+        password=$(openssl rand -hex 16) || return 1
+        password_temp=$(mktemp "${password_file}.tmp.XXXXXX") || return 1
+        printf '%s\n' "$password" > "$password_temp" || return 1
+        # 初始化数据前持久保存新密码，失败重试仍可复用；绝不覆盖已有文件。
+        if ! ln -- "$password_temp" "$password_file"; then
+            log "ERROR: Could not save $password_file without overwriting an existing file; deployment stopped."
+            return 1
+        fi
+    fi
+
+    sudo docker network inspect network1 >/dev/null 2>&1 || sudo docker network create network1 || return 1
+    sudo docker volume create "$volume" >/dev/null || return 1
+    sudo docker run -d --name "$container" --restart=always --network network1 \
+        --env "${password_variable}=${password}" "$@"
+)
+
 deploy_mysql(){
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
@@ -725,12 +798,6 @@ deploy_mysql(){
     fi
     
     local port=${1:-3306}
-    sudo docker network inspect network1 >/dev/null 2>&1 || sudo docker network create network1
-    sudo docker volume create mysql-data
-
-    MYSQL_ROOT_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | cut -c1-12)
-    echo "${MYSQL_ROOT_PASSWORD}" > MYSQL_ROOT_PASSWORD.txt
-
     log "安装 MySQL"
     # docker run -dp ${port}:3306 --name mysql1 --restart=always --network network1 --network-alias mysql -v mysql-data:/var/lib/mysql \
     # -e MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD} \
@@ -744,13 +811,10 @@ deploy_mysql(){
     # --character-set-server=utf8mb4 \
     # --collation-server=utf8mb4_unicode_ci
 
-    sudo docker run -dp "${port}:3306" \
-        --name mysql1 \
-        --restart=always \
-        --network network1 \
+    _deploy_database_container mysql1 mysql-data MYSQL_ROOT_PASSWORD.txt MARIADB_ROOT_PASSWORD \
+        -p "${port}:3306" \
         --network-alias mysql \
         -v mysql-data:/var/lib/mysql \
-        --env MARIADB_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" \
         --env TZ=Asia/Shanghai \
         --env MARIADB_USER=user1 \
         --env MARIADB_PASSWORD=123 \
@@ -759,14 +823,14 @@ deploy_mysql(){
         --env MARIADB_COLLATION=utf8mb4_unicode_ci \
         mariadb:10.6-jammy \
         --character-set-server=utf8mb4 \
-        --collation-server=utf8mb4_unicode_ci
+        --collation-server=utf8mb4_unicode_ci || return 1
 
     # 旧版本
     # docker exec -it mysql1 sed -i -E 's/max_connections(\s*)= [0-9]+/max_connections\1= 1000/g' /etc/mysql/my.cnf
     # docker exec -it mysql1 sed -i -E 's/wait_timeout(\s*)= [0-9]+/wait_timeout\1= 86400/g' /etc/mysql/my.cnf
 
-    sudo docker exec -it mysql1 sed -i -E 's/max_connections(\s*)= [0-9]+/max_connections\1= 1000/g' /etc/mysql/mariadb.conf.d/50-server.cnf
-    sudo docker exec -it mysql1 sed -i -E 's/wait_timeout(\s*)= [0-9]+/wait_timeout\1= 86400/g' /etc/mysql/mariadb.conf.d/50-server.cnf
+    sudo docker exec mysql1 sed -i -E 's/max_connections(\s*)= [0-9]+/max_connections\1= 1000/g' /etc/mysql/mariadb.conf.d/50-server.cnf || return 1
+    sudo docker exec mysql1 sed -i -E 's/wait_timeout(\s*)= [0-9]+/wait_timeout\1= 86400/g' /etc/mysql/mariadb.conf.d/50-server.cnf
 }
 
 create_database(){
@@ -776,25 +840,36 @@ create_database(){
         return
     fi
     
-    local domain_name="$1"
-    MYSQL_ROOT_PASSWORD=$(cat MYSQL_ROOT_PASSWORD.txt)
+    if [ "$#" -ne 1 ] || ! _valid_domain_name "$1"; then
+        log "ERROR: Provide one valid domain name."
+        return 1
+    fi
+    local domain_name="$1" MYSQL_ROOT_PASSWORD
+    MYSQL_ROOT_PASSWORD=$(cat MYSQL_ROOT_PASSWORD.txt) || return 1
+    [ -n "$MYSQL_ROOT_PASSWORD" ] || return 1
 
     # 将创建数据库的sql语句写入sql文件并通过-i参数和<输入重定向符号传递给容器内的命令执行
-    local db_password=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | cut -c1-12)
+    local db_password
+    db_password=$(openssl rand -hex 16) || return 1
     local db_user=${domain_name//./_}
+    if [ "${#db_user}" -gt 61 ]; then
+        log "ERROR: The generated database name exceeds MariaDB's 64-character limit."
+        return 1
+    fi
     
-    cat >${domain_name}.sql <<EOF
-CREATE DATABASE ${db_user}_db
+    cat >"${domain_name}.sql" <<EOF || return 1
+CREATE DATABASE \`${db_user}_db\`
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 CREATE USER '${db_user}'@'%' IDENTIFIED BY '${db_password}';
-GRANT ALL PRIVILEGES ON ${db_user}_db.* TO '${db_user}'@'%';
+GRANT ALL PRIVILEGES ON \`${db_user}_db\`.* TO '${db_user}'@'%';
 FLUSH PRIVILEGES;
 EOF
 
-    local cmd="mysql -h 127.0.0.1 -P 3306 -u root -p${MYSQL_ROOT_PASSWORD} < ${domain_name}.sql"
+    local cmd
+    printf -v cmd 'mysql -h 127.0.0.1 -P 3306 -u root --password=%q < %q' "$MYSQL_ROOT_PASSWORD" "${domain_name}.sql"
     log "请执行${cmd}创建数据库和用户 mysql://${db_user}:${db_password}@mysql:3306/${db_user}_db"
-    log "在容器内创建需执行 docker exec -i mysql1 ${cmd}"
+    log "在容器内创建需执行 sudo docker exec -i mysql1 ${cmd}"
 }
 
 deploy_redis(){
@@ -834,21 +909,12 @@ deploy_postgres(){
     fi
     
     local port=${1:-5432}
-    sudo docker network inspect network1 >/dev/null 2>&1 || sudo docker network create network1
-    sudo docker volume create postgre-data
-    
-    PGSQL_ROOT_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | cut -c1-12)
-    echo "${PGSQL_ROOT_PASSWORD}" > PGSQL_ROOT_PASSWORD.txt
-
     log "安装 PostgreSQL"
-    sudo docker run -dp "${port}:5432" \
-        --name postgres1 \
-        --restart=always \
-        --network network1 \
+    _deploy_database_container postgres1 postgre-data PGSQL_ROOT_PASSWORD.txt POSTGRES_PASSWORD \
+        -p "${port}:5432" \
         --network-alias postgres \
         -e TZ=Asia/Shanghai \
         -e POSTGRES_USER=postgres \
-        -e POSTGRES_PASSWORD="${PGSQL_ROOT_PASSWORD}" \
         -e POSTGRES_DB=postgres \
         -e POSTGRES_INITDB_ARGS="--encoding=UTF8 --locale=C" \
         -e PGDATA=/var/lib/postgresql/data \
@@ -998,30 +1064,25 @@ deploy_gitea(){
 
     local local_port=${1:-3000}
     local ssh_port=${2:-222}
-    sudo adduser \
-        --system \
-        --shell /bin/bash \
-        --gecos 'Git Version Control' \
-        --group \
-        --disabled-password \
-        --home /home/git \
-        git
-    
-    sudo mkdir -p /opt/gitea
-    sudo chmod 777 /opt/gitea
+    sudo docker info >/dev/null || return 1
+    if sudo docker container inspect gitea1 >/dev/null 2>&1; then
+        log "ERROR: gitea1 already exists. Preserve its volumes and follow the README migration steps before recreating it."
+        return 1
+    fi
+    # rootless 镜像固定以 1000:1000 运行，USER_UID/USER_GID 不会更改此用户。
+    sudo install -d -m 0755 -o 1000 -g 1000 /opt/gitea/data /opt/gitea/config || return 1
     sudo docker run -d \
         --name gitea1 \
         --restart=always \
         -p "127.0.0.1:${local_port}:3000" -p "${ssh_port}:2222" \
-        -e USER_UID=$(id -u git) \
-        -e USER_GID=$(id -g git) \
-        -v /opt/gitea:/data \
+        -v /opt/gitea/data:/var/lib/gitea \
+        -v /opt/gitea/config:/etc/gitea \
         -v /etc/timezone:/etc/timezone:ro \
         -v /etc/localtime:/etc/localtime:ro \
         gitea/gitea:1-rootless
     # rootless版默认监听2222, 否则监听22
 
-    # 记得配置SSH_PORT=222，SSH_LISTEN_PORT=22
+    # 对外展示的 SSH_PORT 应与 ssh_port 一致；rootless 的 SSH_LISTEN_PORT 为 2222。
 
     # ssh://git@git.iapp.run:222/zero-ljz/repo.git
 }
@@ -1031,15 +1092,16 @@ install_aria2(){
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     echo -e "\n\n\n------------------------------安装 Aria2------------------------------"
     echo "是否继续？ (y)" && read -t 5 answer && [ ! $? -eq 142 ] && [ "$answer" != "y" ] && return
-    apt -y install aria2
-    mkdir /etc/aria2/
-    touch /etc/aria2/aria2.session
-    wget -O /etc/aria2/aria2.conf https://1fxdpq.dm.files.1drv.com/y4mIiwJL9lNeIdO8lXxaVlJ8CgaezUd3kIe7r8ZcAFytG78pUdSN0RprxwsYBW87AwMyXDAtEc3mLeTYBWHf_D4ngSWtjlCGvsoyA9YVs5Vs2X5taFFJmyl-5VgrMoj4EIKg0PsNXX-U6WC5INaaAK8fCrltwvj0lM0cRW0CuHSfxyAJZ0HaNph3kBqMCrtTwO5M_XR22RkpTRzolxlli3TxQ
+    sudo apt -y install aria2 || return 1
+    sudo mkdir -p /etc/aria2/ || return 1
+    sudo touch /etc/aria2/aria2.session || return 1
+    sudo wget -O /etc/aria2/aria2.conf https://1fxdpq.dm.files.1drv.com/y4mIiwJL9lNeIdO8lXxaVlJ8CgaezUd3kIe7r8ZcAFytG78pUdSN0RprxwsYBW87AwMyXDAtEc3mLeTYBWHf_D4ngSWtjlCGvsoyA9YVs5Vs2X5taFFJmyl-5VgrMoj4EIKg0PsNXX-U6WC5INaaAK8fCrltwvj0lM0cRW0CuHSfxyAJZ0HaNph3kBqMCrtTwO5M_XR22RkpTRzolxlli3TxQ || return 1
 
     echo -e "\n\n\n 使用 systemd 守护 Aria2c RPC Server 进程"
-    create_service aria2c "aria2c --conf-path=/etc/aria2/aria2.conf" /etc/aria2/
-    systemctl enable aria2c
-    systemctl restart aria2c
+    create_service aria2c "aria2c --conf-path=/etc/aria2/aria2.conf" /etc/aria2/ || return 1
+    sudo systemctl daemon-reload || return 1
+    sudo systemctl enable aria2c || return 1
+    sudo systemctl restart aria2c
     # 防火墙需要放行6800
 
 }
@@ -1049,11 +1111,11 @@ install_frp(){
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     echo -e "\n\n\n------------------------------安装 Frp------------------------------"
     echo -e "\n\n\n下载 Frp 二进制包"
-    wget --no-check-certificate -O frp_0.58.0_linux_${ARCH}.tar.gz https://github.com/fatedier/frp/releases/download/v0.58.0/frp_0.58.0_linux_${ARCH}.tar.gz
-    tar xzvf frp_0.58.0_linux_${ARCH}.tar.gz -C /usr/local/bin/
-    mv /usr/local/bin/frp_0.58.0_linux_${ARCH} /usr/local/bin/frp
+    wget --no-check-certificate -O "frp_0.58.0_linux_${ARCH}.tar.gz" "https://github.com/fatedier/frp/releases/download/v0.58.0/frp_0.58.0_linux_${ARCH}.tar.gz" || return 1
+    sudo tar xzvf "frp_0.58.0_linux_${ARCH}.tar.gz" -C /usr/local/bin/ || return 1
+    sudo mv "/usr/local/bin/frp_0.58.0_linux_${ARCH}" /usr/local/bin/frp || return 1
 
-    cat <<EOF > /usr/local/bin/frp/frps.ini
+    sudo tee /usr/local/bin/frp/frps.ini <<EOF >/dev/null || return 1
 [common]
 bind_addr = 0.0.0.0
 bind_port = 7000
@@ -1070,12 +1132,13 @@ EOF
 
 install_frps()
 {
-    install_frp
+    install_frp || return 1
 
     echo -e "\n\n\n 使用 systemd 守护 Frps 进程"
-    create_service frps "/usr/local/bin/frp/frps -c /usr/local/bin/frp/frps.ini" /usr/local/bin/frp
-    systemctl enable frps
-    systemctl restart frps
+    create_service frps "/usr/local/bin/frp/frps -c /usr/local/bin/frp/frps.ini" /usr/local/bin/frp || return 1
+    sudo systemctl daemon-reload || return 1
+    sudo systemctl enable frps || return 1
+    sudo systemctl restart frps
 }
 
 
@@ -1086,23 +1149,23 @@ install_gost(){
     read -p "是否继续？ (y)" -t 5 answer && [ ! $? -eq 142 ] && [ "$answer" != "y" ] && return
     
     # 更新系统并安装解压工具
-    sudo apt update && sudo apt install -y wget gzip
+    sudo apt update && sudo apt install -y wget gzip || return 1
 
     # 下载最新的 gost 2.11.5 版本（这是最经典的稳定版本）
-    wget https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${ARCH}-2.11.5.gz
+    wget "https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-${ARCH}-2.11.5.gz" || return 1
 
     # 解压并重命名
-    gzip -d gost-linux-${ARCH}-2.11.5.gz
-    mv gost-linux-${ARCH}-2.11.5 gost
+    gzip -d "gost-linux-${ARCH}-2.11.5.gz" || return 1
+    mv "gost-linux-${ARCH}-2.11.5" gost || return 1
 
     # 赋予执行权限并移动到系统目录
-    chmod +x gost
-    sudo mv gost /usr/local/bin/
+    chmod +x gost || return 1
+    sudo mv gost /usr/local/bin/ || return 1
     
     echo -e "\n\n\n 生成配置文件"
-    mkdir /etc/gost
+    sudo mkdir -p /etc/gost || return 1
     
-    cat >/etc/gost/config.json << 'EOF'
+    sudo tee /etc/gost/config.json << 'EOF' >/dev/null || return 1
 {
 "Debug": true,
 "Retries": 3,
@@ -1121,10 +1184,10 @@ EOF
 
     echo -e "\n\n\n 使用 Systemd 配置 Gost 开机自启"
     GOST_BIN=$(which gost || echo "/usr/local/bin/gost")
-    create_service "gost" "${GOST_BIN} -C /etc/gost/config.json" "/etc/gost"
-    systemctl daemon-reload
-    systemctl enable gost
-    systemctl start gost
+    create_service "gost" "${GOST_BIN} -C /etc/gost/config.json" "/etc/gost" || return 1
+    sudo systemctl daemon-reload || return 1
+    sudo systemctl enable gost || return 1
+    sudo systemctl start gost || return 1
     log "Gost 已通过 Systemd 成功启动并设置开机自启"
 }
 
@@ -1161,10 +1224,12 @@ deploy_debian() {
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
 
     # 创建空的 Debian 容器并保持运行
-    sudo docker run -d --name debian1 --network host debian:bullseye sleep infinity
+    sudo docker run -d --name debian1 --network host debian:bullseye sleep infinity || return 1
 
     local commands=$(cat <<EOF
-sudo apt update && sudo apt -y install --no-install-recommends wget curl nano micro
+set -e
+apt-get update
+apt-get -y install --no-install-recommends wget curl nano micro
 rm -rf /var/lib/apt/lists/*
 EOF
     )
@@ -1178,27 +1243,35 @@ deploy_python_app() {
         return
     fi
     # sudo docker rm -f iapp && sudo bash ccc.sh deploy_python_app https://github.com/zero-ljz/iapp.git 8000 "python3 -m gunicorn -w 2 -b 0.0.0.0:8000 -k gevent app:app"
-    local repo_url="${1}"
+    local repo_url="${1:-}"
     local http_port="${2:-8000}"
     local command="${3:-"python3 -m gunicorn -b 0.0.0.0:8000 app:app"}"
-    local repo=$(echo "$repo_url" | sed 's|.*/\([^/]*\)\.git|\1|')
-    local commands=$(cat <<EOF
+    local repo="${repo_url##*/}" repo_arg commands
+    repo="${repo%.git}"
+    if [[ ! "$repo" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        log "ERROR: Provide a repository URL with a valid repository name."
+        return 1
+    fi
+    printf -v repo_arg '%q' "$repo_url"
+    commands=$(cat <<EOF
 
-sudo apt update && sudo apt -y install git wget
-if [ -d .git ]; then git pull; else git clone ${repo_url} .; fi
+set -e
+apt-get update
+apt-get -y install --no-install-recommends git wget ca-certificates
+if [ -d .git ]; then git pull; else git clone ${repo_arg} .; fi
 # pip config set global.index-url https://pypi.mirrors.ustc.edu.cn/simple/
 python3 -m pip install -r requirements.txt
 ${command}
 EOF
     )
     sudo docker run -d -p "${http_port}:8000" \
-        --name ${repo} \
+        --name "$repo" \
         --restart=always \
         -v "/opt/${repo}:/usr/src/app" \
         -w /usr/src/app \
         -e TZ=Asia/Shanghai \
-        python:3.10.11-slim-bullseye bash -c "$commands"
-    sudo docker logs ${repo}
+        python:3.10.11-slim-bullseye bash -c "$commands" || return 1
+    sudo docker logs "$repo"
 }
 
 deploy_node_app() {
@@ -1208,27 +1281,35 @@ deploy_node_app() {
         return
     fi
 
-    local repo_url="${1}"
+    local repo_url="${1:-}"
     local http_port="${2:-3000}"
     local command="${3:-"npm start"}"
-    local repo=$(echo "$repo_url" | sed 's|.*/\([^/]*\)\.git|\1|')
-    local commands=$(cat <<EOF
+    local repo="${repo_url##*/}" repo_arg commands
+    repo="${repo%.git}"
+    if [[ ! "$repo" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        log "ERROR: Provide a repository URL with a valid repository name."
+        return 1
+    fi
+    printf -v repo_arg '%q' "$repo_url"
+    commands=$(cat <<EOF
 
-sudo apt update && sudo apt -y install git wget
-if [ -d .git ]; then git pull; else git clone ${repo_url} .; fi
+set -e
+apt-get update
+apt-get -y install --no-install-recommends git wget ca-certificates
+if [ -d .git ]; then git pull; else git clone ${repo_arg} .; fi
 npm install --production --silent
 ${command}
 EOF
 )
     sudo docker run -d -p "${http_port}:3000" \
-        --name ${repo} \
+        --name "$repo" \
         --restart=always \
         -v "/opt/${repo}:/usr/src/app" \
         -w /usr/src/app \
         -e TZ=Asia/Shanghai \
         -e NODE_ENV=production \
-        node:lts-bullseye-slim bash -c "$commands"
-    sudo docker logs ${repo}
+        node:lts-bullseye-slim bash -c "$commands" || return 1
+    sudo docker logs "$repo"
 }
 
 deploy_php_app() {
@@ -1240,10 +1321,16 @@ deploy_php_app() {
 
     local app_name="$1"
     local http_port="$2"
-    sudo docker run -d -p "${http_port}:80" --name ${app_name} -v "/opt/${app_name}:/var/www/html" php:7.4-apache
+    sudo docker run -d -p "${http_port}:80" --name "$app_name" -v "/opt/${app_name}:/var/www/html" php:7.4-apache || return 1
     # 容器内站点配置文件 /etc/apache2/sites-available/000-default.conf
     # 在php官方docker镜像中安装扩展
-    sudo docker exec -t ${app_name} curl -sSL https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions -o - | sh -s gd xdebug pdo_mysql
+    sudo docker exec "$app_name" sh -c '
+        set -eu
+        installer=$(mktemp)
+        trap '\''rm -f -- "$installer"'\'' EXIT
+        curl -fsSL https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions -o "$installer"
+        sh "$installer" gd xdebug pdo_mysql
+    '
     #docker exec -t ${app_name} chmod -R 755 /var/www/html
     # download_php_apps /opt/${app_name}
 }
@@ -1409,13 +1496,16 @@ deploy_redis_commander(){
     local redis_port=${3:-6379}
     local redis_pass=${4:-"123qweQ!"}
 
-    sudo docker network inspect network1 >/dev/null 2>&1 || sudo docker network create network1
+    sudo docker network inspect network1 >/dev/null 2>&1 || sudo docker network create network1 || return 1
     sudo docker run -d --name redis-commander1 \
         --restart always \
         --network network1 \
         -p "${port}:8081" \
-        -e REDIS_HOSTS="${redis_host}:${redis_port}:0:${redis_pass}" \
-        rediscommander/redis-commander:latest
+        -e REDIS_HOST="$redis_host" \
+        -e REDIS_PORT="$redis_port" \
+        -e REDIS_DB=0 \
+        -e REDIS_PASSWORD="$redis_pass" \
+        rediscommander/redis-commander:latest || return 1
     log "Redis Commander 部署成功，请访问 http://IP:${port}"
 }
 
@@ -1471,8 +1561,7 @@ deploy_filebrowser(){
     log "File Browser 部署成功，请访问 http://IP:${port} (默认用户名/密码: admin/admin)"
 }
 
-upgrade()
-{
+upgrade() (
     if [ "$1" = "-d" ] || [ "$1" = "--declare" ]; then declare -f ${FUNCNAME}; return; fi
     if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
         log "Description: Upgrade this script, Perform this operation in the working directory"
@@ -1481,37 +1570,48 @@ upgrade()
     local url="https://raw.githubusercontent.com/zero-ljz/debian-server-toolkit/main/ccc.sh"
     log "正在从 ${url} 下载最新版本脚本..."
     
-    local script_path
-    script_path=$(readlink -f "$0")
-    
-    if [ -f "$script_path" ]; then
-        local tmp_file
-        tmp_file=$(mktemp)
-        if curl -LfsS "$url" -o "$tmp_file"; then
-            if [ -s "$tmp_file" ]; then
-                chmod --reference="$script_path" "$tmp_file" 2>/dev/null || chmod +x "$tmp_file"
-                mv -f "$tmp_file" "$script_path"
-                log "脚本更新成功！"
-                exit 0
-            else
-                log "错误：下载的文件为空"
-                rm -f "$tmp_file"
-                return 1
-            fi
-        else
-            log "错误：下载失败"
-            rm -f "$tmp_file"
-            return 1
-        fi
-    else
+    local script_path script_dir ownership
+    script_path=$(readlink -f -- "${BASH_SOURCE[0]}") || return 1
+    if [ ! -f "$script_path" ]; then
         log "错误：无法确定脚本路径，升级失败"
         return 1
     fi
-}
+    script_dir=$(dirname -- "$script_path") || return 1
+    ownership=$(stat -c '%u:%g' -- "$script_path") || return 1
+    local -a privilege=()
+    # 用户目录内自行更新；受保护目录或不同属主的文件通过 sudo 保留原属主。
+    if [ ! -w "$script_dir" ] || [ ! -x "$script_dir" ] || [ "$ownership" != "$(id -u):$(id -g)" ]; then
+        privilege=(sudo)
+    fi
+
+    local tmp_file staged_file=""
+    tmp_file=$(mktemp) || return 1
+    trap 'rm -f -- "$tmp_file"; if [ -n "$staged_file" ]; then "${privilege[@]}" rm -f -- "$staged_file"; fi' EXIT
+    if ! curl -LfsS "$url" -o "$tmp_file"; then
+        log "错误：下载失败，原脚本未修改"
+        return 1
+    fi
+    if [ ! -s "$tmp_file" ] || ! bash -n "$tmp_file"; then
+        log "错误：下载的脚本为空或 Bash 语法检查失败，原脚本未修改"
+        return 1
+    fi
+
+    # 同目录暂存后原子替换，避免跨文件系统移动或写入失败损坏原脚本。
+    staged_file=$("${privilege[@]}" mktemp "${script_path}.new.XXXXXX") || return 1
+    if ! "${privilege[@]}" cp -- "$tmp_file" "$staged_file" ||
+        ! "${privilege[@]}" chown --reference="$script_path" "$staged_file" ||
+        ! "${privilege[@]}" chmod --reference="$script_path" "$staged_file" ||
+        ! "${privilege[@]}" mv -fT -- "$staged_file" "$script_path"; then
+        log "错误：脚本替换失败，原脚本未修改"
+        return 1
+    fi
+    staged_file=""
+    log "脚本更新成功！"
+)
 
 systeminfo()
 {
-    apt -y install lsb-release curl
+    sudo apt -y install lsb-release curl || return 1
     uname -a && lsb_release -a && lscpu && cat /etc/os-release && hostnamectl && df -h && free -h && timedatectl && curl ipinfo.io
 }
 
@@ -1520,7 +1620,7 @@ function_name=${1:-default}
 shift  # 移除第一个参数，剩下的参数会被传递给函数
 
 # 获取可用函数列表
-function_list=$(compgen -A function)
+function_list=$(compgen -A function | grep -v '^_')
 
 # 定义在不传入参数时默认执行的函数
 function default()

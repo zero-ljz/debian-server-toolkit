@@ -72,6 +72,8 @@ bash ccc.sh enable_https proxy.example.com --redirect
 
 修改前会保留 `.conf.bak.随机后缀` 备份，执行 `nginx -t` 通过后才重载；写入、校验或重载失败时恢复原配置。优先使用正在运行的 `nginx1` 容器，否则使用宿主机 Nginx。修改过模板结构的自定义配置可能被拒绝，需要手动处理。
 
+`create_ssl` 使用 root 创建的私有临时目录下载 ACME 客户端，下载或签发失败立即退出。私钥及 CSR 操作统一通过 `sudo` 执行，签发结果检查有效期、域名及公钥后才替换证书，并检查、重载上述 Nginx。重载失败会恢复旧证书（首次申请则移除未成功加载的新证书），便于下次重试。重载成功后才添加每日 03:15 的检查任务，时间采用服务器时区；剩余有效期超过 30 天时，定时检查跳过申请。脚本需要保留在固定路径，路径不能含换行或 `%`。
+
 部分函数提供帮助信息：
 
 ```bash
@@ -84,7 +86,38 @@ bash ccc.sh deploy_postgres --help
 bash ccc.sh upgrade
 ```
 
-`upgrade` 会从本仓库 `main` 分支下载最新的 `ccc.sh` 并替换当前脚本文件。
+`upgrade` 会从本仓库 `main` 分支下载最新的 `ccc.sh`，通过非空及 Bash 语法检查后，在脚本所在目录暂存并原子替换。更新保留原文件的属主和权限；目标目录不可写或文件属主不同于当前用户时，会使用 `sudo`。下载、校验或替换失败会返回非零状态，保留原脚本，不报告更新成功。
+
+## 数据库凭据与重复部署
+
+`deploy_mysql`、`deploy_postgres` 在同名容器存在时退出，不覆盖原密码记录。重建容器时，会复用当前目录中的 `MYSQL_ROOT_PASSWORD.txt`、`PGSQL_ROOT_PASSWORD.txt`。只有全新数据卷且没有密码文件时才生成新密码，以仅当前用户可读写、禁止覆盖已有文件的方式保存，然后才创建数据卷和容器；首次部署失败也保留这份密码，供检查和重试。
+
+已有 `mysql-data` 或 `postgre-data` 数据卷而缺少密码文件时，脚本会停止：必须恢复该数据库原来的密码记录，不能用新生成的密码冒充原密码。请备份密码文件，并在同一工作目录执行部署。失败的首次创建可能留下空卷，应先核实其内容，再决定如何处理；不要直接删除未知数据卷。
+
+`create_database` 支持包含连字符的域名，对生成的数据库名使用反引号引用，并拒绝非法域名和超过数据库名称长度限制的输入。
+
+## Gitea 持久化与旧实例迁移
+
+`deploy_gitea` 使用 rootless 镜像，将 `/opt/gitea/data` 挂载到 `/var/lib/gitea`，将 `/opt/gitea/config` 挂载到 `/etc/gitea`。这两个目录由镜像使用的 UID/GID `1000:1000` 写入。同名 `gitea1` 容器存在时，部署会停止。
+
+旧版本挂载的 `/data` 不是该镜像实际使用的数据目录。已有实例请先查看 `docker inspect gitea1` 中的 `Mounts`，记录 `/var/lib/gitea` 和 `/etc/gitea` 对应的卷，并备份外部数据库（如使用）。下面的步骤会停止旧实例，需要在维护时间操作；目标 `/opt/gitea/data`、`/opt/gitea/config` 应不存在或为空，已有内容时先检查并备份，不能直接混合复制：
+
+```bash
+sudo docker stop gitea1 &&
+sudo install -d -m 0755 /opt/gitea/data /opt/gitea/config &&
+sudo docker cp -a gitea1:/var/lib/gitea/. /opt/gitea/data/ &&
+sudo docker cp -a gitea1:/etc/gitea/. /opt/gitea/config/ &&
+sudo chown -R 1000:1000 /opt/gitea/data /opt/gitea/config
+```
+
+确认复制成功，检查仓库、数据库及 `app.ini`，并确认本地 `gitea/gitea:1-rootless` 仍是旧容器使用的镜像版本（迁移时避免同时升级），再执行：
+
+```bash
+sudo docker rename gitea1 gitea1-before-migration &&
+bash ccc.sh deploy_gitea 3000 222
+```
+
+新实例应使用原来的端口。旧容器及其卷保留用于恢复；验证仓库、登录、SSH 和配置正常后再自行清理，验证前不要删除旧卷。复制配置时保留原文件权限，尤其是含数据库密码的 `app.ini`。
 
 ## 功能概览
 
@@ -120,6 +153,9 @@ bash ccc.sh upgrade
 ```bash
 bash -n ccc.sh
 shellcheck --severity=error ccc.sh
+python3 -m unittest discover -s tests -v
 ```
 
 当前 ShellCheck 仅阻止错误级问题。脚本包含较多历史代码，警告和风格问题应在不改变既有部署行为的前提下逐步处理。
+
+回归测试需要 Linux、Bash、Python 3 和 OpenSSL，使用临时目录及模拟命令检查部署和证书失败路径，不执行真实部署或访问 ACME 服务。`.gitattributes` 固定 Shell 脚本使用 LF，避免 Windows 检出后在 Linux 上出现 CRLF 语法错误。

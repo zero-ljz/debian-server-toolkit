@@ -24,3 +24,6 @@ jobs:
 
       - name: Run ShellCheck
         run: shellcheck --severity=error ccc.sh
+
+      - name: Test deployment and certificate failure paths
+        run: python3 -m unittest discover -s tests -v
